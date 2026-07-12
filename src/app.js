@@ -22,18 +22,9 @@ const VOICES = [
   "Uncle_Fu",
   "Vivian",
 ];
-const DEFAULT_VOICE = "Sohee";
+const DEFAULT_VOICE = "Ono_Anna";
 
-const DEFAULT_INSTRUCTIONS = [
-  "You are a friendly voice assistant with a visible, human-like 3D avatar: the user",
-  "sees you as a person on their screen. This is a spoken conversation: keep replies",
-  "short, natural and warm, never list-like.",
-  "You can control your avatar body with tools: set_mood changes your overall emotional",
-  "state, make_hand_gesture plays a hand gesture, make_facial_expression makes a quick",
-  "facial expression from a single face emoji. Use them naturally and sparingly to",
-  "express yourself: smile when greeting, shrug when unsure, thumbs up when agreeing.",
-  "Never mention the tools or that you are controlling an avatar.",
-].join(" ");
+let defaultInstructions = "";
 
 const STORAGE_KEYS = {
   voice: "avatar.voice",
@@ -126,10 +117,190 @@ function saveSettings() {
   localStorage.setItem(STORAGE_KEYS.subtitles, settings.subtitles ? "1" : "0");
 }
 
+// ── Profiles & Long-Term Memory ──────────────────────────────────────────
+let profiles = {};
+let activeProfileName = "";
+let activeProfile = null;
+let currentTranscript = [];
+let lastSummarizedLength = 0;
+let isSummarizing = false;
+
+function loadProfiles() {
+  try {
+    profiles = JSON.parse(localStorage.getItem("juno.profiles") || "{}");
+  } catch (err) {
+    profiles = {};
+  }
+}
+
+function saveProfiles() {
+  localStorage.setItem("juno.profiles", JSON.stringify(profiles));
+}
+
+function humanizeTime(timestamp) {
+  if (!timestamp) return "Never";
+  const diff = Date.now() - timestamp;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Just now";
+  const hours = Math.floor(mins / 60);
+  if (hours < 1) return `${mins}m ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 1) return `${hours}h ago`;
+  return `${days}d ago`;
+}
+
+const profileSelectionDlg = /** @type {HTMLDialogElement} */ (document.getElementById("profile-selection"));
+const profileButtonsContainer = document.getElementById("profile-buttons-container");
+const newProfileForm = document.getElementById("new-profile-form");
+const newProfileNameInput = /** @type {HTMLInputElement} */ (document.getElementById("new-profile-name"));
+const btnCreateProfile = document.getElementById("btn-create-profile");
+
+function showProfileSelectionDialog() {
+  if (!profileSelectionDlg || !profileButtonsContainer) return;
+  profileButtonsContainer.innerHTML = "";
+  
+  const profileNames = Object.keys(profiles);
+  profileNames.forEach(name => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "profile-btn";
+    
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = name;
+    btn.appendChild(nameSpan);
+    
+    if (profiles[name].lastActive) {
+      const activeSpan = document.createElement("span");
+      activeSpan.className = "last-active";
+      activeSpan.textContent = humanizeTime(profiles[name].lastActive);
+      btn.appendChild(activeSpan);
+    }
+    
+    btn.addEventListener("click", () => {
+      selectProfile(name);
+      profileSelectionDlg.close();
+    });
+    
+    profileButtonsContainer.appendChild(btn);
+  });
+  
+  const newBtn = document.createElement("button");
+  newBtn.type = "button";
+  newBtn.className = "profile-btn";
+  newBtn.style.borderStyle = "dashed";
+  newBtn.innerHTML = "<span>Someone new...</span>";
+  newBtn.addEventListener("click", () => {
+    profileButtonsContainer.hidden = true;
+    newBtn.hidden = true;
+    newProfileForm.hidden = false;
+    newProfileNameInput.focus();
+  });
+  profileButtonsContainer.appendChild(newBtn);
+  
+  // Clean listener setup
+  const handleCreate = () => {
+    const name = newProfileNameInput.value.trim();
+    if (name) {
+      if (!profiles[name]) {
+        profiles[name] = {
+          memory: "",
+          lastActive: 0
+        };
+        saveProfiles();
+      }
+      selectProfile(name);
+      profileSelectionDlg.close();
+    }
+  };
+  btnCreateProfile?.replaceWith(btnCreateProfile.cloneNode(true));
+  const newBtnCreate = document.getElementById("btn-create-profile");
+  newBtnCreate?.addEventListener("click", handleCreate);
+  
+  newProfileForm.hidden = true;
+  profileButtonsContainer.hidden = false;
+  profileSelectionDlg.showModal();
+}
+
+function selectProfile(name) {
+  activeProfileName = name;
+  activeProfile = profiles[name];
+  
+  setCaption(`TALK TO JUNO AS ${name.toUpperCase()}`);
+  setMainButton("start", "Start talking");
+  
+  settings.voice = "Ono_Anna";
+  saveSettings();
+  
+  console.log(`Active profile: ${name}`, activeProfile);
+}
+
+function checkOpportunisticSummarize() {
+  const unsummarizedMessages = currentTranscript.length - lastSummarizedLength;
+  if (unsummarizedMessages >= 16) { // 8 turns = 16 messages
+    triggerSummarize(false);
+  }
+}
+
+async function triggerSummarize(isFinal = false) {
+  if (!activeProfile || currentTranscript.length === 0) return;
+  if (isSummarizing && !isFinal) return;
+  
+  const payload = {
+    name: activeProfileName,
+    oldMemory: activeProfile.memory || "",
+    transcript: currentTranscript
+  };
+  
+  if (isFinal) {
+    try {
+      navigator.sendBeacon("/api/summarize-session", JSON.stringify(payload));
+      activeProfile.lastActive = Date.now();
+      saveProfiles();
+    } catch (e) {
+      console.warn("Beacon failed:", e);
+    }
+    return;
+  }
+  
+  isSummarizing = true;
+  try {
+    const resp = await fetch("/api/summarize-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.summary) {
+        activeProfile.memory = data.summary;
+        activeProfile.lastActive = Date.now();
+        saveProfiles();
+        lastSummarizedLength = currentTranscript.length;
+        console.log("Juno updated memory about you:", data.summary);
+      }
+    }
+  } catch (err) {
+    console.warn("Opportunistic summarization failed:", err);
+  } finally {
+    isSummarizing = false;
+  }
+}
+
 /** Persona + whatever extra guidance the user typed in Settings. */
 function effectiveInstructions() {
   const extra = settings.instructions.trim();
-  return extra ? `${DEFAULT_INSTRUCTIONS}\n\nAdditional instructions from the user:\n${extra}` : DEFAULT_INSTRUCTIONS;
+  let basePrompt = defaultInstructions;
+  
+  let memoryBlock = "";
+  if (activeProfile && activeProfile.lastActive) {
+    const elapsed = humanizeTime(activeProfile.lastActive);
+    memoryBlock = `Returning user: ${activeProfileName}. Last spoke: ${elapsed}.\nWhat you remember about them: ${activeProfile.memory || "Nothing yet."}`;
+  } else {
+    memoryBlock = `This is a brand-new person. Their name is ${activeProfileName}. Get their name confirmed naturally and be extra charming.`;
+  }
+  
+  basePrompt = basePrompt.replace("{{MEMORY}}", memoryBlock);
+  return extra ? `${basePrompt}\n\nAdditional instructions from the user:\n${extra}` : basePrompt;
 }
 
 // ── Captions / subtitles ─────────────────────────────────────────────────
@@ -233,6 +404,9 @@ function runTool(name, argsJson, callId) {
 
 // ── Session lifecycle ────────────────────────────────────────────────────
 async function startSession() {
+  currentTranscript = [];
+  lastSummarizedLength = 0;
+
   // Everything audible hangs off the avatar's AudioContext; resume it inside
   // the tap gesture or iOS keeps it suspended (silent).
   stage.resume();
@@ -279,8 +453,19 @@ async function startSession() {
   });
 
   c.addEventListener("transcript", (e) => {
-    const { role, text } = /** @type {CustomEvent} */ (e).detail;
-    if (role === "assistant" && text) showSubtitles(text);
+    const { role, text, done } = /** @type {CustomEvent} */ (e).detail;
+    if (role === "assistant" && text) {
+      showSubtitles(text);
+    }
+    
+    // Accumulate conversation transcript for summarization
+    if (role === "user" && text) {
+      currentTranscript.push({ role: "user", text });
+      checkOpportunisticSummarize();
+    } else if (role === "assistant" && done && text) {
+      currentTranscript.push({ role: "assistant", text });
+      checkOpportunisticSummarize();
+    }
   });
 
   c.addEventListener("response-finished", () => {
@@ -326,6 +511,8 @@ async function endSession(silent = false) {
   if (c) {
     for (const track of c.options.micStream?.getTracks() ?? []) track.stop();
     await c.close().catch(() => {});
+    // Trigger final session summary
+    void triggerSummarize(false);
   }
   stage.setConversationState("idle");
   subtitles.classList.remove("visible");
@@ -372,10 +559,30 @@ settingsDialog.addEventListener("close", () => {
 
 window.addEventListener("beforeunload", () => {
   client?.close();
+  triggerSummarize(true);
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────
 async function boot() {
+  loadProfiles();
+
+  // Load the system prompt from the backend
+  try {
+    const personaResp = await fetch("/api/persona");
+    if (personaResp.ok) {
+      defaultInstructions = await personaResp.text();
+    }
+  } catch (err) {
+    console.error("Failed to load persona.md:", err);
+  }
+
+  // Force Ono_Anna voice
+  settings.voice = "Ono_Anna";
+  saveSettings();
+
+  // Show profile selection dialog!
+  showProfileSelectionDialog();
+
   for (const v of VOICES) {
     const o = document.createElement("option");
     o.value = v;
@@ -391,8 +598,8 @@ async function boot() {
   }
   directUrlRow.hidden = !config.allowDirect;
 
-  setCaption("WAKING HER UP…");
-  setMainButton("busy", "Loading…");
+  setCaption("CHOOSE A PROFILE TO WAKE HER UP…");
+  setMainButton("busy", "Select profile");
   try {
     await stage.init({
       onprogress: (ev) => {
@@ -409,8 +616,6 @@ async function boot() {
     return;
   }
   loading.classList.add("done");
-  setCaption(CAPTIONS.idle);
-  setMainButton("start", "Start talking");
 
   // Debug handles
   Object.assign(window, { stage, getClient: () => client });
