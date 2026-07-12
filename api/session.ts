@@ -1,5 +1,18 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
+function appendSetCookie(res: VercelResponse, value: string) {
+  const current = res.getHeader("Set-Cookie");
+  if (!current) {
+    res.setHeader("Set-Cookie", value);
+    return;
+  }
+  if (Array.isArray(current)) {
+    res.setHeader("Set-Cookie", [...current, value]);
+    return;
+  }
+  res.setHeader("Set-Cookie", [String(current), value]);
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const UPSTREAM = process.env.LOAD_BALANCER_URL || process.env.SESSION_PROXY_URL;
   if (!UPSTREAM) {
@@ -25,7 +38,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       (resp.headers.get("set-cookie") ? [resp.headers.get("set-cookie") as string] : []);
     for (const sc of setCookies) {
       const sanitized = sc.split(";").map(p => p.trim()).filter(p => !/^domain=/i.test(p)).join("; ");
-      res.appendHeader("Set-Cookie", sanitized);
+      appendSetCookie(res, sanitized);
     }
 
     res.status(resp.status).json(body);
